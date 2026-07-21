@@ -18,10 +18,43 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 300
 const PARENT_FOLDER_ID = process.env.DRIVE_PARENT_FOLDER_ID; // the "root" Drive folder everything gets created inside
 const ADMIN_API_KEY = process.env.PROXY_API_KEY; // required for admin-only actions (creating folders)
 
-// ── Google Drive client (service account) ──────────────────────────────────
+// ── Google Drive client ──────────────────────────────────────────────────
+// IMPORTANT: Service accounts have ZERO storage quota of their own on a
+// personal Gmail setup (no Google Workspace / Shared Drives available), so
+// they can create folders but every upload fails with "Service Accounts do
+// not have storage quota". The fix is to authenticate as a real Google
+// account (yours) via OAuth2 instead — uploads then count against your
+// normal 15GB+ Drive quota, same as if you'd uploaded them by hand.
+//
+// One-time setup to get here: visit GET /auth/google on this deployed
+// service, sign in with the Google account you want files to live in,
+// approve access, and it'll show you a refresh token to paste into
+// GOOGLE_OAUTH_REFRESH_TOKEN below. See README.md for the full walkthrough.
+const OAUTH_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID;
+const OAUTH_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+const OAUTH_REDIRECT_URI = process.env.GOOGLE_OAUTH_REDIRECT_URI; // e.g. https://your-app.up.railway.app/auth/google/callback
+const OAUTH_REFRESH_TOKEN = process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
+
+function getOAuth2Client() {
+  if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET || !OAUTH_REDIRECT_URI) {
+    throw new Error('GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URI env vars are not set — see README.md step 1.');
+  }
+  return new google.auth.OAuth2(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_REDIRECT_URI);
+}
+
 function getDriveClient() {
+  // Preferred path: OAuth2 as a real Google account (works for personal Gmail).
+  if (OAUTH_REFRESH_TOKEN) {
+    const oauth2Client = getOAuth2Client();
+    oauth2Client.setCredentials({ refresh_token: OAUTH_REFRESH_TOKEN });
+    return google.drive({ version: 'v3', auth: oauth2Client });
+  }
+  // Legacy fallback: service account. Only viable if this Drive is on a
+  // Google Workspace plan with Shared Drives / domain-wide delegation set up
+  // — plain Gmail will hit "Service Accounts do not have storage quota" on
+  // every upload.
   const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!keyJson) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON env var is not set');
+  if (!keyJson) throw new Error('Neither GOOGLE_OAUTH_REFRESH_TOKEN nor GOOGLE_SERVICE_ACCOUNT_JSON is set — see README.md.');
   const credentials = JSON.parse(keyJson);
   const auth = new google.auth.GoogleAuth({
     credentials,
@@ -44,6 +77,50 @@ function requireAdminKey(req, res, next) {
 
 // ── Health check ─────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.send('HVN Drive Proxy is running.'));
+
+// ── One-time OAuth setup ─────────────────────────────────────────────────
+// Visit this in a browser once, sign in with the Google account you want
+// all script content to live in, and approve access. Not locked behind the
+// admin key on purpose — it's meant to be opened directly in a browser, and
+// it's useless to anyone without your Google login anyway.
+app.get('/auth/google', (req, res) => {
+  try {
+    const oauth2Client = getOAuth2Client();
+    const url = oauth2Client.generateAuthUrl({
+      access_type: 'offline', // required to get a refresh_token back
+      prompt: 'consent',      // forces a fresh refresh_token even if you've approved before
+      scope: ['https://www.googleapis.com/auth/drive'],
+    });
+    res.redirect(url);
+  } catch (e) {
+    res.status(500).send('Setup error: ' + e.message);
+  }
+});
+
+app.get('/auth/google/callback', async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) return res.status(400).send('Missing ?code from Google.');
+    const oauth2Client = getOAuth2Client();
+    const { tokens } = await oauth2Client.getToken(code);
+    if (!tokens.refresh_token) {
+      return res.status(200).send(
+        'Got a token but no refresh_token — this usually means you\'d already ' +
+        'granted access before. Go to https://myaccount.google.com/permissions, ' +
+        'remove access for this app, then visit /auth/google again.'
+      );
+    }
+    res.send(
+      '<pre style="font-family:monospace;white-space:pre-wrap;word-break:break-all;padding:20px;">' +
+      'Success! Copy this value into Railway as GOOGLE_OAUTH_REFRESH_TOKEN:\n\n' +
+      tokens.refresh_token +
+      '\n\nThen redeploy. You can close this tab after copying it.' +
+      '</pre>'
+    );
+  } catch (e) {
+    res.status(500).send('Token exchange error: ' + e.message);
+  }
+});
 
 // ── Create a folder for a model's script ────────────────────────────────
 // Called once when an admin creates a script for a model in Sexting Scripts.
